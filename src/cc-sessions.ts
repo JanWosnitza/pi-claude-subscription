@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -58,8 +58,37 @@ export function findMessageUuid(cwd: string, sessionId: string, messageId: strin
  */
 export function synthesizeSession(cwd: string, model: string, messages: TurnMessage[]): { sessionId: string; at: string } {
 	const sessionId = randomUUID();
+	const { lines, last } = transcriptLines(cwd, sessionId, model, messages, null);
+	mkdirSync(projectDir(cwd), { recursive: true });
+	writeFileSync(join(projectDir(cwd), `${sessionId}.jsonl`), `${lines.join("\n")}\n`);
+	return { sessionId, at: last! };
+}
+
+/**
+ * Append history that Claude Code never ran to the end of an existing transcript, such as a fork
+ * whose pi history continues differently. Returns the uuid to resume at, or undefined when the
+ * transcript or its last message entry cannot be found.
+ */
+export function appendToSession(cwd: string, sessionId: string, model: string, messages: TurnMessage[]): string | undefined {
+	const file = sessionFile(cwd, sessionId);
+	if (!file) return undefined;
+	let parent: string | undefined;
+	for (const line of readFileSync(file, "utf8").split("\n")) {
+		if (!line) continue;
+		try {
+			const e = JSON.parse(line);
+			if ((e.type === "user" || e.type === "assistant") && !e.isSidechain && typeof e.uuid === "string") parent = e.uuid;
+		} catch {}
+	}
+	if (!parent) return undefined;
+	const { lines, last } = transcriptLines(cwd, sessionId, model, messages, parent);
+	appendFileSync(file, `${lines.join("\n")}\n`);
+	return last ?? undefined;
+}
+
+function transcriptLines(cwd: string, sessionId: string, model: string, messages: TurnMessage[], start: string | null): { lines: string[]; last: string | null } {
 	const lines: string[] = [];
-	let parent: string | null = null;
+	let parent: string | null = start;
 	const now = Date.now();
 	const common = { isSidechain: false, userType: "external", entrypoint: "sdk-cli", cwd, sessionId };
 	// Thinking signatures are only needed (and only checked) inside the trailing tool loop;
@@ -83,7 +112,7 @@ export function synthesizeSession(cwd: string, model: string, messages: TurnMess
 					...common,
 					type: "assistant",
 					message: {
-						id: `msg_pi_${(n++).toString(36)}_${sessionId.slice(0, 8)}`,
+						id: `msg_pi_${(n++).toString(36)}_${uuid.slice(0, 8)}`,
 						type: "message",
 						role: "assistant",
 						model,
@@ -115,7 +144,5 @@ export function synthesizeSession(cwd: string, model: string, messages: TurnMess
 		}
 		parent = uuid;
 	}
-	mkdirSync(projectDir(cwd), { recursive: true });
-	writeFileSync(join(projectDir(cwd), `${sessionId}.jsonl`), `${lines.join("\n")}\n`);
-	return { sessionId, at: parent! };
+	return { lines, last: parent };
 }

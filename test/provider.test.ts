@@ -1,7 +1,7 @@
 // Offline tests for the provider's event translation and routing, driven by a fake Claude Code session
 // that replays scripted SDK events.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -294,6 +294,68 @@ describe("routing", () => {
 		assert.equal(a2.route, "resume");
 		assert.deepEqual(h2.created[0].spec.resume, { sessionId: sid, at: "uuid-A" });
 		assert.equal(text(a2.msg), "second");
+	});
+
+	it("appends an edited tail to the fork instead of dropping its assistant messages", async () => {
+		const streamed = (id: string, uuid: string) => ({ type: "assistant", uuid, parent_tool_use_id: null, message: { id } });
+		const h = harness([
+			[...apiMessage("msg_A", [{ tool: "read", id: "toolu_1", args: { path: "a" } }], "tool_use"), streamed("msg_A", "uuid-A")],
+			[...apiMessage("msg_B", [{ tool: "read", id: "toolu_2", args: { path: "b".repeat(50) } }], "tool_use"), streamed("msg_B", "uuid-B")],
+			[...apiMessage("msg_C", [{ text: "done" }], "end_turn"), result],
+		]);
+		const forkFile = (sid: string) => join(projectDir(h.cwd), `fork-${sid}.jsonl`);
+		(h.provider as any).opts.forkSession = async (sessionId: string, cwd: string, at: string) => {
+			h.forkCalls.push({ sessionId, cwd, at });
+			mkdirSync(projectDir(h.cwd), { recursive: true });
+			writeFileSync(forkFile(sessionId), `${JSON.stringify({ type: "assistant", uuid: "fork-uuid-A", isSidechain: false, message: { id: "msg_A" } })}\n${JSON.stringify({ type: "custom-title", title: "pi" })}\n`);
+			return { sessionId: `fork-${sessionId}` };
+		};
+		const hist: Message[] = [user("go")];
+		const a1 = await h.call(hist);
+		hist.push(a1.msg, toolResult("toolu_1", "A"));
+		const a2 = await h.call(hist);
+		assert.equal(a2.route, "live");
+		// pi shrinks the second call before it is ever sent back.
+		const shrunk = { ...a2.msg, content: [{ type: "toolCall", id: "toolu_2", name: "read", arguments: { path: "b…" } }] } as AssistantMessage;
+		hist.push(shrunk, toolResult("toolu_2", "B"));
+		const a3 = await h.call(hist);
+		assert.equal(a3.route, "resume");
+		const sid = h.created[0].sessionId;
+		assert.deepEqual(h.forkCalls, [{ sessionId: sid, cwd: h.cwd, at: "uuid-A" }], "forked at the last unedited assistant message");
+		const entries = readFileSync(forkFile(sid), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		const [user1, asst2] = entries.slice(2);
+		assert.equal(user1.parentUuid, "fork-uuid-A");
+		assert.equal(user1.message.content[0].tool_use_id, "toolu_1");
+		assert.equal(asst2.parentUuid, user1.uuid);
+		assert.deepEqual(asst2.message.content, [{ type: "tool_use", id: "toolu_2", name: "mcp__pi__read", input: { path: "b…" } }]);
+		assert.deepEqual(h.created[1].spec.resume, { sessionId: `fork-${sid}`, at: asst2.uuid });
+		assert.equal(h.created[1].sent.length, 1);
+		assert.deepEqual(h.created[1].sent[0].map((b: any) => b.tool_use_id), ["toolu_2"], "only the results after the edited message are sent");
+		assert.equal(text(a3.msg), "done");
+	});
+
+	it("synthesizes instead of resuming the source session when an edited tail cannot be appended", async () => {
+		const streamed = { type: "assistant", uuid: "uuid-A", parent_tool_use_id: null, message: { id: "msg_A" } };
+		const h = harness(
+			[
+				[...apiMessage("msg_A", [{ tool: "read", id: "toolu_1", args: { path: "a" } }], "tool_use"), streamed],
+				[...apiMessage("msg_B", [{ tool: "read", id: "toolu_2", args: { path: "b" } }], "tool_use")],
+				[...apiMessage("msg_C", [{ text: "done" }], "end_turn"), result],
+			],
+			undefined,
+			{ forkSession: async () => { throw new Error("fork unavailable"); } },
+		);
+		const hist: Message[] = [user("go")];
+		const a1 = await h.call(hist);
+		hist.push(a1.msg, toolResult("toolu_1", "A"));
+		const a2 = await h.call(hist);
+		const shrunk = { ...a2.msg, content: [{ type: "toolCall", id: "toolu_2", name: "read", arguments: { path: "short" } }] } as AssistantMessage;
+		hist.push(shrunk, toolResult("toolu_2", "B"));
+		const a3 = await h.call(hist);
+		assert.equal(a3.route, "synth");
+		assert.notEqual(h.created[1].spec.resume?.sessionId, h.created[0].sessionId, "the source session is left untouched");
+		assert.deepEqual(h.created[1].sent[0].map((b: any) => b.tool_use_id), ["toolu_2"]);
+		assert.equal(text(a3.msg), "done");
 	});
 
 	it("synthesizes a session for history from another provider", async () => {

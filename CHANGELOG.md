@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Fix:** a conversation whose pi history was edited after the resume point no longer loses messages. Extensions can change or remove earlier messages with context edits; the provider then resumed Claude Code at the last matching assistant message and sent the rest as one user turn, which silently dropped every assistant message in it (Claude Code received tool results for calls it never saw). Those messages are now written into the fork's transcript before it is resumed, and only the final user turn is sent. If no fork can be written, the session is synthesized instead of resuming the source session.
+
 ## 0.2.4 — 2026-10-16
 
 - **Change:** divergence now uses the Agent SDK's native session operations. Claude Code sessions record the transcript-entry uuid streamed with each assistant message, anchors persist that uuid, and a diverged or restarted conversation is copied with `forkSession` up to the anchored entry before the fork is resumed — instead of resuming the source session at a uuid found by scanning Claude Code's transcript files. Anchors persisted by older versions still resolve through that scan, and if forking fails the provider falls back to resuming the source session at the anchor.

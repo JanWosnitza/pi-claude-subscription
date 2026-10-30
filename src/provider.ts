@@ -14,7 +14,7 @@ import type {
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { forkSession as forkSdkSession } from "@anthropic-ai/claude-agent-sdk";
 import { AnchorRegistry } from "./anchors.ts";
-import { findMessageUuid, synthesizeSession } from "./cc-sessions.ts";
+import { appendToSession, findMessageUuid, synthesizeSession } from "./cc-sessions.ts";
 import { piToolName, readTranscript, type Transcript, type TurnMessage, userTurnBlocks, fingerprint } from "./convert.ts";
 import { thinkingOptions } from "./models.ts";
 import { type ClaudeSession, errorText, LiveSession, type SessionSpec } from "./session.ts";
@@ -228,14 +228,34 @@ export class ClaudeSdkProvider {
 			// transcript is forked: Claude Code may still be writing its final entries.
 			for (const s of this.sessions) if (s.sessionId === a.sessionId) this.drop(s);
 			await this.waitExited(a.sessionId);
+			// pi's history can continue differently from Claude Code's transcript after the anchor, for
+			// example when an extension edited or removed later messages. Claude Code only takes a user
+			// turn as input, so assistant messages after the anchor are written into the fork first.
+			let lastAssistant = -1;
+			for (let i = k; i < n; i++) if (t.messages[i].role === "assistant") lastAssistant = i;
+			let forkedId: string | undefined;
 			resume = { sessionId: a.sessionId, at };
 			try {
 				const forked = await (this.opts.forkSession ?? forkPersistedSession)(a.sessionId, spec.cwd, at);
-				if (forked.sessionId && forked.sessionId !== a.sessionId) resume = { sessionId: forked.sessionId };
+				if (forked.sessionId && forked.sessionId !== a.sessionId) {
+					resume = { sessionId: forked.sessionId };
+					forkedId = forked.sessionId;
+				}
 			} catch (e) {
 				this.log(`fork anchor ${a.sessionId}/${a.messageId} failed (${errorText(e)}); resuming source session`);
 			}
 			prefix = k;
+			if (lastAssistant >= 0) {
+				// Never append to the source session: other branches resume from it.
+				const appendedAt = forkedId ? appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(k, lastAssistant + 1)) : undefined;
+				if (!appendedAt) {
+					this.log(`cannot write the diverged history into a fork of ${a.sessionId}; synthesizing`);
+					resume = undefined;
+					break;
+				}
+				resume = { sessionId: forkedId!, at: appendedAt };
+				prefix = lastAssistant + 1;
+			}
 			route = "resume";
 			break;
 		}
