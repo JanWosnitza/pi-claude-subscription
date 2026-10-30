@@ -59,7 +59,9 @@ sequenceDiagram
   streamed uuid; their entry uuid is resolved from Claude Code's transcript file as a fallback.
   When pi's history continues differently after that entry, for example because an extension
   edited or removed later messages with context edits, those messages are written into the fork's
-  transcript before it is resumed.
+  transcript before it is resumed. Tool results that answer the anchor's calls go into the fork
+  too, so Claude Code never resumes at unanswered calls; results it recorded itself are kept as
+  its own entries, which keeps them cached.
 - **Foreign history is synthesized.** Turns from other providers, a compacted session, or a session
   from before the extension was installed are written as a Claude Code transcript (tool ids
   sanitized, cross-model thinking dropped) and resumed.

@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { assistantBlocks, type TurnMessage, userTurnBlocks } from "./convert.ts";
+import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
+import { assistantBlocks, toolResultBlock, type TurnMessage, userTurnBlocks } from "./convert.ts";
 
 function projectsRoot(): string {
 	return join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
@@ -62,6 +62,50 @@ export function synthesizeSession(cwd: string, model: string, messages: TurnMess
 	mkdirSync(projectDir(cwd), { recursive: true });
 	writeFileSync(join(projectDir(cwd), `${sessionId}.jsonl`), `${lines.join("\n")}\n`);
 	return { sessionId, at: last! };
+}
+
+/**
+ * Claude Code records the tool results it was given right after an assistant entry, followed by
+ * the context it attached to that turn. When `results` are exactly the results recorded after
+ * entry `at`, return the uuid of the last entry before Claude Code's next assistant message:
+ * forking there keeps the bytes Claude Code sent, and so its prompt cache, through that turn.
+ */
+export function findEndOfResults(cwd: string, sessionId: string, at: string, results: ToolResultMessage[]): string | undefined {
+	const file = sessionFile(cwd, sessionId);
+	if (!file || results.length === 0) return undefined;
+	// File order: with parallel calls each result hangs off its own tool_use entry, so the results
+	// do not form one parent chain, but Claude Code writes them right after the assistant entries.
+	const entries: any[] = [];
+	for (const line of readFileSync(file, "utf8").split("\n")) {
+		if (!line) continue;
+		try {
+			const e = JSON.parse(line);
+			if (!e.isSidechain && typeof e.uuid === "string") entries.push(e);
+		} catch {}
+	}
+	let from = entries.findIndex((e) => e.uuid === at);
+	if (from < 0) return undefined;
+	// Claude Code writes one entry per content block; skip the rest of the anchor's message.
+	const messageId = entries[from].message?.id;
+	while (messageId && entries[from + 1]?.type === "assistant" && entries[from + 1].message?.id === messageId) from++;
+	const recorded: string[] = [];
+	let last: string | undefined;
+	for (const e of entries.slice(from + 1)) {
+		if (e.type === "assistant") break;
+		if (e.type === "user") {
+			const blocks = Array.isArray(e.message?.content) ? e.message.content : [];
+			// Anything but tool results (user text, a steering message) means it differs from pi's turn.
+			if (blocks.length === 0 || blocks.some((b: any) => b?.type !== "tool_result")) return undefined;
+			for (const { tool_use_id, content, is_error } of blocks) {
+				const text = typeof content === "string" ? [{ type: "text", text: content }] : content;
+				recorded.push(JSON.stringify({ type: "tool_result", tool_use_id, content: text, ...(is_error ? { is_error: true } : {}) }));
+			}
+		}
+		last = e.uuid;
+	}
+	const expected = results.map((r) => JSON.stringify(toolResultBlock(r))).sort();
+	recorded.sort();
+	return recorded.length === expected.length && recorded.every((r, i) => r === expected[i]) ? last : undefined;
 }
 
 /**

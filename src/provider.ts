@@ -14,7 +14,7 @@ import type {
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { forkSession as forkSdkSession } from "@anthropic-ai/claude-agent-sdk";
 import { AnchorRegistry } from "./anchors.ts";
-import { appendToSession, findMessageUuid, synthesizeSession } from "./cc-sessions.ts";
+import { appendToSession, findEndOfResults, findMessageUuid, synthesizeSession } from "./cc-sessions.ts";
 import { piToolName, readTranscript, type Transcript, type TurnMessage, userTurnBlocks, fingerprint } from "./convert.ts";
 import { thinkingOptions } from "./models.ts";
 import { type ClaudeSession, errorText, LiveSession, type SessionSpec } from "./session.ts";
@@ -233,10 +233,20 @@ export class ClaudeSdkProvider {
 			// turn as input, so assistant messages after the anchor are written into the fork first.
 			let lastAssistant = -1;
 			for (let i = k; i < n; i++) if (t.messages[i].role === "assistant") lastAssistant = i;
+			// Tool results right after the anchor answer its calls. Resuming a transcript that ends in
+			// unanswered calls makes Claude Code insert "interrupted" results of its own, so the results
+			// go into the fork too: if Claude Code recorded exactly these, fork after its own entries
+			// (which keeps its cached bytes), otherwise write pi's. Something must remain to send.
+			let results = k;
+			while (results < n && t.messages[results].role === "toolResult") results++;
+			const endOfResults = results > k && results < n ? findEndOfResults(spec.cwd, a.sessionId, at, t.messages.slice(k, results) as ToolResultMessage[]) : undefined;
+			const forkAt = endOfResults ?? at;
+			const writeFrom = endOfResults ? results : k;
+			const writeTo = lastAssistant >= 0 ? lastAssistant + 1 : results < n ? results : writeFrom;
 			let forkedId: string | undefined;
 			resume = { sessionId: a.sessionId, at };
 			try {
-				const forked = await (this.opts.forkSession ?? forkPersistedSession)(a.sessionId, spec.cwd, at);
+				const forked = await (this.opts.forkSession ?? forkPersistedSession)(a.sessionId, spec.cwd, forkAt);
 				if (forked.sessionId && forked.sessionId !== a.sessionId) {
 					resume = { sessionId: forked.sessionId };
 					forkedId = forked.sessionId;
@@ -244,17 +254,26 @@ export class ClaudeSdkProvider {
 			} catch (e) {
 				this.log(`fork anchor ${a.sessionId}/${a.messageId} failed (${errorText(e)}); resuming source session`);
 			}
-			prefix = k;
-			if (lastAssistant >= 0) {
-				// Never append to the source session: other branches resume from it.
-				const appendedAt = forkedId ? appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(k, lastAssistant + 1)) : undefined;
+			if (!forkedId) {
+				// Resuming the source session at the anchor, as before; never write into it, other
+				// branches resume from it.
+				prefix = k;
+				if (lastAssistant >= 0) {
+					this.log(`cannot write the diverged history without a fork of ${a.sessionId}; synthesizing`);
+					resume = undefined;
+					break;
+				}
+			} else if (writeTo > writeFrom) {
+				const appendedAt = appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(writeFrom, writeTo));
 				if (!appendedAt) {
 					this.log(`cannot write the diverged history into a fork of ${a.sessionId}; synthesizing`);
 					resume = undefined;
 					break;
 				}
-				resume = { sessionId: forkedId!, at: appendedAt };
-				prefix = lastAssistant + 1;
+				resume = { sessionId: forkedId, at: appendedAt };
+				prefix = writeTo;
+			} else {
+				prefix = writeFrom;
 			}
 			route = "resume";
 			break;
