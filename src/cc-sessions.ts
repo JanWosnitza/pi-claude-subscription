@@ -135,12 +135,8 @@ function transcriptLines(cwd: string, sessionId: string, model: string, messages
 	let parent: string | null = start;
 	const now = Date.now();
 	const common = { isSidechain: false, userType: "external", entrypoint: "sdk-cli", cwd, sessionId };
-	// Thinking signatures are only needed (and only checked) inside the trailing tool loop;
-	// earlier thinking is dropped by the API anyway.
-	let lastUserText = -1;
-	messages.forEach((m, i) => {
-		if (m.role === "user") lastUserText = i;
-	});
+	// Keep thinking on every assistant message of this model: Claude Code sends earlier thinking too,
+	// so a re-written transcript must match the one written before or the prompt cache misses.
 	let i = 0;
 	let n = 0;
 	while (i < messages.length) {
@@ -148,7 +144,7 @@ function transcriptLines(cwd: string, sessionId: string, model: string, messages
 		const timestamp = new Date(now - (messages.length - i) * 1000).toISOString();
 		const m = messages[i];
 		if (m.role === "assistant") {
-			const keepThinking = i > lastUserText && m.model === model && (m.api === "claude-agent-sdk" || m.api === "anthropic-messages");
+			const keepThinking = m.model === model && (m.api === "claude-agent-sdk" || m.api === "anthropic-messages");
 			const content = assistantBlocks(m as AssistantMessage, keepThinking);
 			lines.push(
 				JSON.stringify({
