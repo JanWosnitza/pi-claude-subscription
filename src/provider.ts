@@ -14,7 +14,7 @@ import type {
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { forkSession as forkSdkSession } from "@anthropic-ai/claude-agent-sdk";
 import { AnchorRegistry } from "./anchors.ts";
-import { appendToSession, findEndOfResults, findMessageUuid, findTurnStart, synthesizeSession } from "./cc-sessions.ts";
+import { appendToSession, findEndOfResults, findMessageUuid, findTurnStart, synthesizeSession, type WrittenEntry } from "./cc-sessions.ts";
 import { piToolName, readTranscript, type Transcript, type TurnMessage, userTurnBlocks, fingerprint } from "./convert.ts";
 import { thinkingOptions } from "./models.ts";
 import { type ClaudeSession, errorText, LiveSession, type SessionSpec } from "./session.ts";
@@ -276,12 +276,14 @@ export class ClaudeSdkProvider {
 					break;
 				}
 			} else if (writeTo > writeFrom) {
-				const appendedAt = appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(writeFrom, writeTo));
+				const written: WrittenEntry[] = [];
+				const appendedAt = appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(writeFrom, writeTo), written);
 				if (!appendedAt) {
 					this.log(`cannot write the diverged history into a fork of ${a.sessionId}; synthesizing`);
 					resume = undefined;
 					break;
 				}
+				this.rememberWritten(t, writeFrom, forkedId, spec, written);
 				resume = { sessionId: forkedId, at: appendedAt };
 				prefix = writeTo;
 			} else {
@@ -296,7 +298,9 @@ export class ClaudeSdkProvider {
 				if (m.role === "assistant") last = i;
 			});
 			if (last >= 0) {
-				resume = synthesizeSession(spec.cwd, spec.model, t.messages.slice(0, last + 1));
+				const written: WrittenEntry[] = [];
+				resume = synthesizeSession(spec.cwd, spec.model, t.messages.slice(0, last + 1), written);
+				this.rememberWritten(t, 0, resume.sessionId, spec, written);
 				prefix = last + 1;
 				route = "synth";
 			}
@@ -340,9 +344,25 @@ export class ClaudeSdkProvider {
 			this.log(`fork after the user turn of ${a.sessionId} failed (${errorText(e)})`);
 		}
 		if (!forkedId) return undefined;
-		const appendedAt = appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(k, lastAssistant + 1));
+		const written: WrittenEntry[] = [];
+		const appendedAt = appendToSession(spec.cwd, forkedId, spec.model, t.messages.slice(k, lastAssistant + 1), written);
 		if (!appendedAt) return undefined;
+		this.rememberWritten(t, k, forkedId, spec, written);
 		return { resume: { sessionId: forkedId, at: appendedAt }, prefix: lastAssistant + 1 };
+	}
+
+	/**
+	 * Anchors for assistant messages the provider wrote into a transcript (`offset` is where the written
+	 * messages start in `t`). Claude Code sends those entries as written, so a later edit inside that
+	 * history can resume there and keep the cached prefix instead of synthesizing it again.
+	 */
+	private rememberWritten(t: Transcript, offset: number, sessionId: string, spec: SessionSpec, written: WrittenEntry[]): void {
+		if (spec.tools.length === 0) return;
+		for (const w of written) {
+			const i = offset + w.index;
+			this.registry.put(t.chain[i + 1], { sessionId, messageId: w.messageId, cwd: spec.cwd, entryUuid: w.uuid });
+			if (i > 0 && t.messages[i - 1].role === "user") this.registry.put(`u:${t.chain[i]}`, { sessionId, messageId: w.messageId, cwd: spec.cwd });
+		}
 	}
 
 	/**

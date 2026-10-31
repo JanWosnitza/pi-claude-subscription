@@ -68,14 +68,21 @@ export function findTurnStart(cwd: string, sessionId: string, messageId: string)
 	return undefined;
 }
 
+/** An assistant message written into a transcript: `index` is its position in the messages given. */
+export interface WrittenEntry {
+	index: number;
+	messageId: string;
+	uuid: string;
+}
+
 /**
  * Write a Claude Code transcript for history that never ran through Claude Code (another
  * provider's turns, a compacted session, a session from before this extension). Returns the
  * session id and the uuid to resume at. `messages` must end with an assistant message.
  */
-export function synthesizeSession(cwd: string, model: string, messages: TurnMessage[]): { sessionId: string; at: string } {
+export function synthesizeSession(cwd: string, model: string, messages: TurnMessage[], written?: WrittenEntry[]): { sessionId: string; at: string } {
 	const sessionId = randomUUID();
-	const { lines, last } = transcriptLines(cwd, sessionId, model, messages, null);
+	const { lines, last } = transcriptLines(cwd, sessionId, model, messages, null, written);
 	mkdirSync(projectDir(cwd), { recursive: true });
 	writeFileSync(join(projectDir(cwd), `${sessionId}.jsonl`), `${lines.join("\n")}\n`);
 	return { sessionId, at: last! };
@@ -130,7 +137,7 @@ export function findEndOfResults(cwd: string, sessionId: string, at: string, res
  * whose pi history continues differently. Returns the uuid to resume at, or undefined when the
  * transcript or its last message entry cannot be found.
  */
-export function appendToSession(cwd: string, sessionId: string, model: string, messages: TurnMessage[]): string | undefined {
+export function appendToSession(cwd: string, sessionId: string, model: string, messages: TurnMessage[], written?: WrittenEntry[]): string | undefined {
 	const file = sessionFile(cwd, sessionId);
 	if (!file) return undefined;
 	let parent: string | undefined;
@@ -143,12 +150,19 @@ export function appendToSession(cwd: string, sessionId: string, model: string, m
 		} catch {}
 	}
 	if (!parent) return undefined;
-	const { lines, last } = transcriptLines(cwd, sessionId, model, messages, parent);
+	const { lines, last } = transcriptLines(cwd, sessionId, model, messages, parent, written);
 	appendFileSync(file, `${lines.join("\n")}\n`);
 	return last ?? undefined;
 }
 
-function transcriptLines(cwd: string, sessionId: string, model: string, messages: TurnMessage[], start: string | null): { lines: string[]; last: string | null } {
+function transcriptLines(
+	cwd: string,
+	sessionId: string,
+	model: string,
+	messages: TurnMessage[],
+	start: string | null,
+	written?: WrittenEntry[],
+): { lines: string[]; last: string | null } {
 	const lines: string[] = [];
 	let parent: string | null = start;
 	const now = Date.now();
@@ -164,13 +178,15 @@ function transcriptLines(cwd: string, sessionId: string, model: string, messages
 		if (m.role === "assistant") {
 			const keepThinking = m.model === model && (m.api === "claude-agent-sdk" || m.api === "anthropic-messages");
 			const content = assistantBlocks(m as AssistantMessage, keepThinking);
+			const id = `msg_pi_${(n++).toString(36)}_${uuid.slice(0, 8)}`;
+			written?.push({ index: i, messageId: id, uuid });
 			lines.push(
 				JSON.stringify({
 					parentUuid: parent,
 					...common,
 					type: "assistant",
 					message: {
-						id: `msg_pi_${(n++).toString(36)}_${uuid.slice(0, 8)}`,
+						id,
 						type: "message",
 						role: "assistant",
 						model,

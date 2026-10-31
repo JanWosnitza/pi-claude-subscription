@@ -548,6 +548,20 @@ describe("routing", () => {
 		assert.deepEqual(h.created[0].sent[0], [{ type: "text", text: "continue" }]);
 	});
 
+	it("resumes inside synthesized history after a later edit instead of synthesizing it again", async () => {
+		const h = harness([[...apiMessage("m", [{ text: "ok" }], "end_turn"), result], [...apiMessage("m2", [{ text: "ok2" }], "end_turn"), result]]);
+		const foreign = { role: "assistant", content: [{ type: "text", text: "hi from gpt" }], api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 1 } as AssistantMessage;
+		const a1 = await h.call([user("hello"), foreign, user("continue")]);
+		assert.equal(a1.route, "synth");
+		const synthId = h.created[0].sessionId;
+		const entry = h.created[0].spec.resume!.at;
+		// An edit removes the last turn and its answer: the written entry for `foreign` is still the resume point.
+		const a2 = await h.call([user("hello"), foreign, user("something else")]);
+		assert.equal(a2.route, "resume");
+		assert.deepEqual(h.forkCalls, [{ sessionId: synthId, cwd: h.cwd, at: entry }]);
+		assert.equal(text(a2.msg), "ok2");
+	});
+
 	it("never attaches a second concurrent request to a busy session (F4)", async () => {
 		const h = harness([[], [...apiMessage("m2", [{ text: "b" }], "end_turn"), result]]);
 		const ac = new AbortController();
