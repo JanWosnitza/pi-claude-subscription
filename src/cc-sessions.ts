@@ -52,6 +52,23 @@ export function findMessageUuid(cwd: string, sessionId: string, messageId: strin
 }
 
 /**
+ * The uuid of the last entry Claude Code recorded before API message `messageId`: the end of the
+ * user turn it answered, including the context Claude Code attached to it.
+ */
+export function findTurnStart(cwd: string, sessionId: string, messageId: string): string | undefined {
+	const file = sessionFile(cwd, sessionId);
+	if (!file) return undefined;
+	for (const line of readFileSync(file, "utf8").split("\n")) {
+		if (!line.includes(messageId)) continue;
+		try {
+			const e = JSON.parse(line);
+			if (e.type === "assistant" && e.message?.id === messageId && !e.isSidechain) return typeof e.parentUuid === "string" ? e.parentUuid : undefined;
+		} catch {}
+	}
+	return undefined;
+}
+
+/**
  * Write a Claude Code transcript for history that never ran through Claude Code (another
  * provider's turns, a compacted session, a session from before this extension). Returns the
  * session id and the uuid to resume at. `messages` must end with an assistant message.
@@ -121,7 +138,8 @@ export function appendToSession(cwd: string, sessionId: string, model: string, m
 		if (!line) continue;
 		try {
 			const e = JSON.parse(line);
-			if ((e.type === "user" || e.type === "assistant") && !e.isSidechain && typeof e.uuid === "string") parent = e.uuid;
+			// Attachments (environment, date, ...) are part of the turn Claude Code sends: append after them.
+			if ((e.type === "user" || e.type === "assistant" || e.type === "attachment") && !e.isSidechain && typeof e.uuid === "string") parent = e.uuid;
 		} catch {}
 	}
 	if (!parent) return undefined;

@@ -377,6 +377,49 @@ describe("routing", () => {
 		assert.equal(text(a3.msg), "done");
 	});
 
+	it("resumes right after Claude Code's recorded user turn when every response after it was edited", async () => {
+		const h = harness([
+			[...apiMessage("msg_A", [{ tool: "read", id: "toolu_1", args: { path: "a" } }], "tool_use")],
+			[...apiMessage("msg_B", [{ tool: "read", id: "toolu_2", args: { path: "b" } }], "tool_use")],
+			[...apiMessage("msg_C", [{ text: "done" }], "end_turn"), result],
+		]);
+		const forks: string[] = [];
+		(h.provider as any).opts.forkSession = async (sessionId: string, _cwd: string, at: string) => {
+			forks.push(at);
+			writeFileSync(
+				join(projectDir(h.cwd), `fork-${sessionId}.jsonl`),
+				`${JSON.stringify({ type: "user", uuid: "fork-user", parentUuid: null, isSidechain: false, message: { content: [] } })}\n${JSON.stringify({ type: "attachment", uuid: "fork-att", parentUuid: "fork-user", isSidechain: false })}\n`,
+			);
+			return { sessionId: `fork-${sessionId}` };
+		};
+		const hist: Message[] = [user("go")];
+		const a1 = await h.call(hist);
+		hist.push(a1.msg, toolResult("toolu_1", "A"));
+		const a2 = await h.call(hist);
+		// What Claude Code recorded: the user turn, context it attached, then its responses.
+		const sid = h.created[0].sessionId;
+		const entry = (o: object) => JSON.stringify({ isSidechain: false, ...o });
+		mkdirSync(projectDir(h.cwd), { recursive: true });
+		writeFileSync(
+			join(projectDir(h.cwd), `${sid}.jsonl`),
+			[
+				entry({ type: "user", uuid: "u0", parentUuid: null, message: { content: [{ type: "text", text: "go" }] } }),
+				entry({ type: "attachment", uuid: "att-0", parentUuid: "u0" }),
+				entry({ type: "assistant", uuid: "uuid-A", parentUuid: "att-0", message: { id: "msg_A" } }),
+			].join("\n"),
+		);
+		// A compaction removed the first response and its result; only the second call is kept.
+		const kept = { ...a2.msg, content: [{ type: "toolCall", id: "toolu_2", name: "read", arguments: { path: "b" } }] } as AssistantMessage;
+		const a3 = await h.call([user("go"), kept, toolResult("toolu_2", "B")]);
+		assert.equal(a3.route, "resume");
+		assert.deepEqual(forks, ["att-0"], "forked after the user turn and its attachment");
+		const appended = readFileSync(join(projectDir(h.cwd), `fork-${sid}.jsonl`), "utf8").trim().split("\n").slice(2).map((l) => JSON.parse(l));
+		assert.deepEqual(appended.map((e) => e.type), ["assistant"], "only the kept assistant message is written");
+		assert.equal(appended[0].parentUuid, "fork-att", "after the context Claude Code attached to the user turn");
+		assert.deepEqual(h.created[1].sent[0].map((b: any) => b.tool_use_id), ["toolu_2"]);
+		assert.equal(text(a3.msg), "done");
+	});
+
 	it("never resumes at unanswered tool calls: forks after Claude Code's recorded parallel results", async () => {
 		const streamed = { type: "assistant", uuid: "uuid-A2", parent_tool_use_id: null, message: { id: "msg_A" } };
 		const h = harness([
